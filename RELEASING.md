@@ -11,7 +11,7 @@ the install scripts.
 | --- | --- | --- |
 | `x86_64-unknown-linux-musl` | `ubuntu-24.04` | `.tar.gz` (static) |
 | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` | `.tar.gz` (static) |
-| `aarch64-apple-darwin` | `macos-14` | `.tar.gz` |
+| `aarch64-apple-darwin` | `macos-latest` | `.tar.gz` |
 | `x86_64-pc-windows-msvc` | `windows-latest` | `.zip` |
 
 ## Day-to-day

@@ -648,7 +648,7 @@ which builds on native runners:
 |---|---|
 | `x86_64-unknown-linux-musl` (static) | `ubuntu-24.04` |
 | `aarch64-unknown-linux-musl` (static) | `ubuntu-24.04-arm` |
-| `aarch64-apple-darwin` | `macos-14` |
+| `aarch64-apple-darwin` | `macos-latest` |
 | `x86_64-pc-windows-msvc` | `windows-latest` |
 
 The release carries the archives, their SHA-256 checksums, `install.sh`, and
