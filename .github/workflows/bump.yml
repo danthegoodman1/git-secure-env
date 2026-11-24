@@ -1,0 +1,131 @@
+name: Auto Release
+
+# Releases on every push to main: decides a version, commits it to main, and
+# tags it. The tag starts release.yml, which builds the binaries and publishes
+# the GitHub release.
+#
+# The bump is a patch unless the head commit message (a merge commit carries
+# the pull request's title) says otherwise:
+#   "#minor" / "#major"  bump that level instead
+#   "[skip release]"     release nothing for this push
+# Manual runs (Actions -> Auto Release -> Run workflow) pick a level.
+#
+# The first release (no v* tag yet) ships Cargo.toml's version as it stands.
+#
+# This triggers on push, so it runs the tests itself before tagging.
+#
+# main's ruleset requires pull requests and green checks, and lets deploy keys
+# bypass it, so the chore(release) commit and the tag go out over SSH with the
+# RELEASE_DEPLOY_KEY deploy key. A push with a deploy key starts workflows: the
+# tag starts release.yml, and the commit starts this workflow again, which
+# skips it by its message.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+      - name: Decide bump level
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            level="$INPUT_BUMP"
+          else
+            case "$HEAD_MSG" in
+              "chore(release):"*)
+                echo "Release commit; skipping"
+                echo "release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+            if grep -qF '[skip release]' <<< "$HEAD_MSG"; then
+              echo "[skip release] marker; skipping"
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            level="patch"
+            grep -qF '#minor' <<< "$HEAD_MSG" && level=minor
+            grep -qF '#major' <<< "$HEAD_MSG" && level=major
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+          echo "Bump level: $level"
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.decide.outputs.release == 'true'
+        with:
+          toolchain: "1.100.0"
+      - uses: Swatinem/rust-cache@v2
+        if: steps.decide.outputs.release == 'true'
+      - name: Test before tagging
+        if: steps.decide.outputs.release == 'true'
+        run: cargo test --locked
+      - name: Bump version
+        id: version
+        if: steps.decide.outputs.release == 'true'
+        run: |
+          current=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ -z "$(git tag -l 'v*')" ]; then
+            new="$current"
+            echo "First release: $current as it stands"
+            echo "commit=false" >> "$GITHUB_OUTPUT"
+          else
+            IFS=. read -r major minor patch <<< "$current"
+            case "${{ steps.decide.outputs.level }}" in
+              major) new="$((major + 1)).0.0" ;;
+              minor) new="${major}.$((minor + 1)).0" ;;
+              patch) new="${major}.${minor}.$((patch + 1))" ;;
+            esac
+            sed -i "0,/^version = \"${current}\"$/s//version = \"${new}\"/" Cargo.toml
+            cargo update --workspace
+            echo "commit=true" >> "$GITHUB_OUTPUT"
+            echo "Releasing $current -> $new"
+          fi
+          if git rev-parse -q --verify "refs/tags/v$new" >/dev/null; then
+            echo "::error::Tag v$new already exists" >&2
+            exit 1
+          fi
+          echo "tag=v$new" >> "$GITHUB_OUTPUT"
+      - name: Commit and tag, which starts release.yml
+        if: steps.decide.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "${{ steps.version.outputs.commit }}" = "true" ]; then
+            git commit -am "chore(release): ${{ steps.version.outputs.tag }}"
+            git push origin main
+          fi
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "refs/tags/${{ steps.version.outputs.tag }}"

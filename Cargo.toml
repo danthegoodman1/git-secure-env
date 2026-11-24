@@ -1,0 +1,36 @@
+[package]
+name = "git-secure-env"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Commit .env files to git, encrypted with age, synced by git hooks"
+repository = "https://github.com/danthegoodman1/git-secure-env"
+readme = "README.md"
+keywords = ["git", "dotenv", "secrets", "age", "encryption"]
+categories = ["command-line-utilities", "cryptography"]
+
+[dependencies]
+age = { version = "0.12", features = ["ssh", "armor"] }
+anyhow = "1.0.105"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+diffy = "0.5.2"
+globset = "0.4.22"
+rpassword = "7.5.5"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.10"
+toml = "1.2.2"
+ureq = "3"
+
+[[bin]]
+name = "gse"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

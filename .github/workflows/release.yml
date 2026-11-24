@@ -1,0 +1,106 @@
+name: Release
+
+# Builds gse for each platform and publishes the GitHub release. Runs when a
+# v* tag is pushed, as bump.yml does with its deploy key, or manually through
+# workflow_dispatch to rebuild an existing tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to build and release
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+          targets: ${{ matrix.target }}
+      # Static Linux binaries: ring's C code compiles with musl-gcc.
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          var="CC_$(echo '${{ matrix.target }}' | tr '-' '_')"
+          echo "$var=musl-gcc" >> "$GITHUB_ENV"
+      - name: Verify the tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="gse-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp README.md "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "../target/${{ matrix.target }}/release/gse.exe" "$name/"
+            7z a -tzip "$name.zip" "$name" >/dev/null
+            sha256sum "$name.zip" > "$name.zip.sha256"
+          else
+            cp "../target/${{ matrix.target }}/release/gse" "$name/"
+            tar -czf "$name.tar.gz" "$name"
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+          rm -rf "$name"
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp scripts/install.sh scripts/install.ps1 dist/
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG" --verify-tag --generate-notes
+          gh release upload "$TAG" dist/* --clobber
