@@ -30,6 +30,10 @@ Set up git-secure-env (gse) in this repository: https://github.com/danthegoodman
 1. Run `gse --version`. If gse is missing, ask me before installing it with:
    - macOS/Linux: curl -fsSL https://github.com/danthegoodman1/git-secure-env/releases/latest/download/install.sh | sh
    - Windows: irm https://github.com/danthegoodman1/git-secure-env/releases/latest/download/install.ps1 | iex
+   If `cargo` is installed, offer to build from source instead:
+   cargo install --locked --git https://github.com/danthegoodman1/git-secure-env
+   If `gse` is not found right after installing, run it by the full path the
+   installer printed.
 2. Run `gse doctor`. If it reports missing hooks, run `gse install`, which adds
    global git hooks, and run `gse doctor` again.
 3. If it reports no identity, ask whether I have one from another machine. If
@@ -37,14 +41,18 @@ Set up git-secure-env (gse) in this repository: https://github.com/danthegoodman
    me for a handle (default: my username) and run `gse keygen --handle <handle>`.
    Never read or print the identity's contents. Remind me to back up
    ~/.config/gse/identity.txt in a password manager.
-4. Run `gse init`. It tracks the repository's gitignored `.env*` files as my
-   personal files and adds a short gse section to AGENTS.md.
+4. Run `gse init`. It tracks the repository's untracked `.env*` files as my
+   personal files, gitignores them, and adds a short gse section to AGENTS.md.
 5. Run `gse status` to confirm each file is encrypted. Show me the staged
    changes and ask before committing.
 ````
 
 The section `gse init` adds to `AGENTS.md` tells later agent sessions how the
 repository's env files work.
+
+Use an agent on your own machine. An agent in a cloud VM would leave gse and
+your identity on a throwaway machine; give it a key of its own, as with
+[CI](#ci).
 
 ## Features
 
@@ -112,10 +120,15 @@ Windows (PowerShell):
 irm https://github.com/danthegoodman1/git-secure-env/releases/latest/download/install.ps1 | iex
 ```
 
-From source:
+The installer puts gse in `~/.local/bin` and, when that directory is missing
+from PATH, adds it in your shell's startup file. `GSE_NO_MODIFY_PATH=1` prints
+the line to add instead. The Windows installer uses `%LOCALAPPDATA%\gse\bin`
+and adds it to your user PATH.
+
+From source, on any platform Rust supports:
 
 ```sh
-cargo install --git https://github.com/danthegoodman1/git-secure-env
+cargo install --locked --git https://github.com/danthegoodman1/git-secure-env
 ```
 
 Then, once per machine:
@@ -135,12 +148,13 @@ your personal files.
 
 ```sh
 cd my-repo
-gse init                            # track the gitignored .env* files it finds
+gse init                            # track the .env* files it finds
 git commit -m "Track env files with gse"
 ```
 
 `gse init` writes `.gse/` (config, a README for humans and agents, git
-attributes), adds ignore rules, and adds a gse section to `AGENTS.md`. On a
+attributes), gitignores the env files it tracks, and adds a gse section to
+`AGENTS.md`. Templates such as `.env.example` stay as they are. On a
 new clone, the checkout hook decrypts your files.
 
 ### Share with a team
@@ -229,6 +243,10 @@ which run alongside husky, lefthook, and repository hooks. Older git gets a
 global `core.hooksPath` of shims that run gse, then chain to each
 repository's own hooks. A repository-local `core.hooksPath` (husky sets one)
 overrides the global shims; `gse doctor` reports it.
+
+The hooks and drivers run gse by the full path `gse install` recorded, so
+they work in git clients whose PATH lacks gse, such as IDEs. If gse moves,
+they use the gse on PATH; `gse doctor` reports the change.
 
 Hooks block a commit in two cases: an env file staged in plaintext, or one
 with unresolved conflict markers. `GSE_SKIP=1` skips gse for one command.

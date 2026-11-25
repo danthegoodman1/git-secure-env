@@ -332,12 +332,14 @@ pub fn track(pattern: &str, scope: &str) -> Result<()> {
         }),
     }
     cfg.save(&repo.root)?;
+    let glob = compile_glob(pattern)?;
+    let moved = stale_copies(&repo, &cfg, &glob)?;
+    repo.rm(&moved)?;
     let mut stage = vec![".gse/config.toml".to_string()];
     if ensure_ignored(&repo, &cfg)? {
         stage.push(".gitignore".into());
     }
     repo.add(&stage)?;
-    let glob = compile_glob(pattern)?;
     for path in repo.indexed()? {
         if glob.is_match(&path) {
             ui::warn(format!(
@@ -346,8 +348,81 @@ pub fn track(pattern: &str, scope: &str) -> Result<()> {
             ));
         }
     }
+    warn_shadowed(&repo, &cfg, pattern, &glob, scope)?;
     ui::info(format!("tracking {pattern} in scope {scope}"));
-    open_ctx(&repo)?.sync()?;
+    let ctx = open_ctx(&repo)?;
+    for cipher in &moved {
+        ctx.state.clear_base(cipher);
+    }
+    if !moved.is_empty() {
+        ui::info(format!(
+            "removed {} encrypted cop{} from the previous scope",
+            moved.len(),
+            if moved.len() == 1 { "y" } else { "ies" }
+        ));
+    }
+    ctx.sync()?;
+    Ok(())
+}
+
+/// Encrypted copies of files matching `glob` in a scope the config no longer
+/// assigns them to.
+fn stale_copies(repo: &Repo, cfg: &RepoConfig, glob: &globset::GlobMatcher) -> Result<Vec<String>> {
+    let matcher = cfg.matcher()?;
+    let mut stale = Vec::new();
+    for dir in [".gse/users", ".gse/shared"] {
+        for cipher in walk_age(&repo.root, dir) {
+            let Some(e) = Ctx::entry_for_cipher(&cipher) else {
+                continue;
+            };
+            if !glob.is_match(&e.plain) {
+                continue;
+            }
+            let current = match (matcher.scope_for(&e.plain), &e.scope) {
+                (Some(USER_SCOPE), Scope::User(_)) => true,
+                (Some(want), Scope::Shared(have)) => want == have,
+                _ => false,
+            };
+            if !current {
+                stale.push(cipher);
+            }
+        }
+    }
+    Ok(stale)
+}
+
+/// Warns about files `pattern` matches that an earlier rule assigns to
+/// another scope, since the first matching rule wins.
+fn warn_shadowed(
+    repo: &Repo,
+    cfg: &RepoConfig,
+    pattern: &str,
+    glob: &globset::GlobMatcher,
+    scope: &str,
+) -> Result<()> {
+    let mut paths: Vec<String> = repo
+        .candidates()?
+        .into_iter()
+        .filter(|p| !p.ends_with('/') && !p.starts_with(".gse/") && glob.is_match(p))
+        .collect();
+    if !pattern.contains(['*', '?', '[', '{']) && !paths.iter().any(|p| p == pattern) {
+        paths.push(pattern.to_string());
+    }
+    for path in paths {
+        let winner = cfg
+            .files
+            .iter()
+            .find(|r| compile_glob(&r.path).is_ok_and(|g| g.is_match(&path)));
+        if let Some(rule) = winner
+            && rule.scope != scope
+        {
+            ui::warn(format!(
+                "{path} stays in scope {} because the earlier rule `{}` matches it first; \
+                 untrack that rule or move it below this one in .gse/config.toml",
+                rule.scope, rule.path
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -360,19 +435,7 @@ pub fn untrack(pattern: &str) -> Result<()> {
         bail!("no tracked pattern {pattern:?} in .gse/config.toml");
     }
     cfg.save(&repo.root)?;
-    let glob = compile_glob(pattern)?;
-    let remaining = cfg.matcher()?;
-    let mut gone = Vec::new();
-    for dir in [".gse/users", ".gse/shared"] {
-        for cipher in walk_age(&repo.root, dir) {
-            if let Some(e) = Ctx::entry_for_cipher(&cipher)
-                && glob.is_match(&e.plain)
-                && remaining.scope_for(&e.plain).is_none()
-            {
-                gone.push(cipher);
-            }
-        }
-    }
+    let gone = stale_copies(&repo, &cfg, &compile_glob(pattern)?)?;
     repo.rm(&gone)?;
     repo.add(&[".gse/config.toml".to_string()])?;
     let ctx = open_ctx(&repo)?;

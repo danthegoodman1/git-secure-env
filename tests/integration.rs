@@ -721,3 +721,91 @@ fn grant_a_github_user_who_decrypts_with_an_ssh_key() {
     laptop.git(&a, &["pull", "-q", "--no-rebase"]);
     assert_eq!(read(&a.join(".env.team")), "T=2\n");
 }
+
+#[test]
+fn track_moves_a_file_between_scopes() {
+    let world = World::new();
+    let laptop = world.machine("laptop", "dan");
+    laptop.setup();
+    let a = laptop.clone(&world, "repo");
+    write(&a.join(".env.prod"), "A=prod\n");
+    laptop.gse(&a, &["init", "--no-agents"]);
+    assert!(a.join(".gse/users/dan/.env.prod.age").exists());
+    laptop.gse(&a, &["track", ".env.prod", "--scope", "ci"]);
+    laptop.git(&a, &["commit", "-q", "-m", "init"]);
+    let files = laptop.git(&a, &["ls-files", ".gse"]);
+    assert!(files.contains(".gse/shared/ci/.env.prod.age"), "{files}");
+    assert!(!files.contains(".gse/users/dan/.env.prod.age"), "{files}");
+    assert!(!a.join(".gse/users/dan/.env.prod.age").exists());
+}
+
+#[test]
+fn track_warns_when_an_earlier_rule_wins() {
+    let world = World::new();
+    let laptop = world.machine("laptop", "dan");
+    laptop.setup();
+    let a = laptop.clone(&world, "repo");
+    // With no env files to find, init tracks **/.env.local.
+    laptop.gse(&a, &["init", "--no-agents"]);
+    write(&a.join(".env.local"), "A=1\n");
+    let out = laptop.gse_out(&a, &["track", ".env.local", "--scope", "team"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("stays in scope user because the earlier rule `**/.env.local`"),
+        "{}",
+        text(&out)
+    );
+}
+
+/// A PATH with git and the system tools but without gse, like the PATH an
+/// IDE's git integration can run hooks with.
+fn path_without_gse() -> String {
+    let path = std::env::var_os("PATH").unwrap();
+    let git_dir = std::env::split_paths(&path)
+        .find(|d| d.join("git").is_file())
+        .expect("git on PATH");
+    format!("{}:/usr/bin:/bin", git_dir.display())
+}
+
+#[test]
+fn hooks_run_the_installed_binary_then_fall_back_to_path() {
+    let world = World::new();
+    let laptop = world.machine("laptop", "dan");
+    let copy = laptop.root.join("opt/gse");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::copy(gse_bin(), &copy).unwrap();
+    let out = laptop.run_raw(&copy, &laptop.root, &["install"], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    laptop.gse(&laptop.root, &["keygen", "--handle", "dan"]);
+    let a = start(&world, &laptop, "A=1\n");
+    let cipher = ".gse/users/dan/.env.local.age";
+
+    let bare = path_without_gse();
+    let found = laptop.run_raw(
+        Path::new("sh"),
+        &a,
+        &["-c", "command -v gse"],
+        &[("PATH", &bare)],
+    );
+    assert!(
+        !found.status.success(),
+        "this test needs a PATH without gse: {bare}"
+    );
+    write(&a.join(".env.local"), "A=2\n");
+    write(&a.join("app.txt"), "v2\n");
+    for args in [&["add", "app.txt"][..], &["commit", "-q", "-m", "v2"]] {
+        let out = laptop.run_raw(Path::new("git"), &a, args, &[("PATH", &bare)]);
+        assert!(out.status.success(), "{}", text(&out));
+    }
+    let changed = laptop.git(&a, &["diff", "--name-only", "HEAD~1", "HEAD"]);
+    assert!(changed.contains(cipher), "{changed}");
+
+    std::fs::remove_file(&copy).unwrap();
+    write(&a.join(".env.local"), "A=3\n");
+    write(&a.join("app.txt"), "v3\n");
+    laptop.git(&a, &["commit", "-q", "-am", "v3"]);
+    let changed = laptop.git(&a, &["diff", "--name-only", "HEAD~1", "HEAD"]);
+    assert!(changed.contains(cipher), "{changed}");
+    let doctor = String::from_utf8_lossy(&laptop.gse_out(&a, &["doctor"]).stdout).into_owned();
+    assert!(doctor.contains("which is gone"), "{doctor}");
+}
