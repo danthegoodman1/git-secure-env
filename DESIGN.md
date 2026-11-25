@@ -94,8 +94,11 @@ default = [".env", ".env.local"]
 ci = [".env", ".env.ci"]
 ```
 
-`path` is a glob relative to the repository root. `user` is a reserved scope
-name. `gse track` and `gse untrack` edit this file.
+`path` is a glob relative to the repository root, and the first matching
+`[[file]]` decides a file's scope. `user` is a reserved scope name.
+`gse track` and `gse untrack` edit this file. Moving a pattern to another
+scope with `gse track` removes its copies from the old scope, and `gse track`
+warns when an earlier rule keeps a file in a different scope.
 
 ### `recipients.txt`
 
@@ -182,24 +185,11 @@ tells future agents about it in `AGENTS.md`.
 
 ### Setup prompt in the project README
 
-The gse README carries this prompt for users to paste into Claude or another
-coding agent:
-
-````markdown
-Set up git-secure-env (gse) in this repository: https://github.com/danthegoodman1/git-secure-env
-
-1. Run `gse --version`. If gse is missing, ask me before installing it, then
-   follow the install steps in its README.
-2. Run `gse doctor`. If it reports missing hooks, run `gse install` (it adds
-   global git hooks), then run `gse doctor` again.
-3. If it reports no identity, ask whether I have one from another machine.
-   Import it with `gse keygen --import`, or create one with `gse keygen`. Keep
-   the identity's contents out of this conversation.
-4. Run `gse init`. If the repository has no `.gse/` yet, first ask me which env
-   files to track.
-5. Run `gse status` and confirm each tracked env file is decrypted and in sync.
-6. Tell me what changed, including the gse section `gse init` added to AGENTS.md.
-````
+The [README](README.md#set-up-with-an-agent) carries a prompt for users to
+paste into Claude or another coding agent on their own machine. It has the
+agent install gse after asking (the prebuilt binary, or `cargo install` when
+cargo is available), run `gse install` and `gse doctor`, import or create the
+identity without reading it, run `gse init`, and ask before committing.
 
 ### `AGENTS.md` section
 
@@ -427,9 +417,12 @@ Observed hook events (git 2.53):
 
 ```
 merge.gse.name = gse encrypted env merge
-merge.gse.driver = gse merge-driver %O %A %B %P
-diff.gse.textconv = gse textconv
+merge.gse.driver = g='/Users/alice/.local/bin/gse'; [ -x "$g" ] || g=$(command -v gse) || g=gse; "$g" merge-driver %O %A %B %P
+diff.gse.textconv = g='/Users/alice/.local/bin/gse'; [ -x "$g" ] || g=$(command -v gse) || g=gse; "$g" textconv
 ```
+
+Like the hooks, they run the gse binary `gse install` recorded, falling back
+to the gse on PATH ([Hook installation](#hook-installation)).
 
 Git calls the driver when both sides changed the same `.age` file during a
 merge, rebase, or cherry-pick. It decrypts all three versions and merges them
@@ -471,17 +464,24 @@ Hooks exit within a millisecond or two in repositories without
 
 `gse install` runs once per machine. It checks `git version` and picks a mode.
 
+Every hook and driver runs the gse binary `gse install` recorded, by its full
+path, so they work in git clients whose PATH lacks gse, such as IDEs. When
+that binary is gone, they fall back to the gse on PATH. `gse install` records
+the gse on PATH when that is the running binary, so a package manager's link
+there survives upgrades; otherwise it records the running binary itself.
+
 ### Git 2.54 and later: config-based hooks
 
 ```
-hook.gse-pre-commit.command = command -v gse >/dev/null 2>&1 || exit 0; gse hook pre-commit
+hook.gse-pre-commit.command = g='/Users/alice/.local/bin/gse'; [ -x "$g" ] || g=$(command -v gse) || exit 0; "$g" hook pre-commit
 hook.gse-pre-commit.event = pre-commit
 ```
 
 and the same for `post-commit`, `post-checkout`, `post-merge`, and
 `post-rewrite`. Git runs the command through `sh -c` and appends `"$@"` when
-the hook has arguments, which this form accepts. The `command -v` guard lets
-commits through if gse is uninstalled without `gse uninstall`.
+the hook has arguments, which this form accepts. With no gse to run, the hook
+exits 0, which lets commits through if gse is removed without
+`gse uninstall`.
 
 Config hooks run alongside husky, lefthook, and repository hooks; the
 traditional hook script runs last. Friendly names cannot equal an event name,
@@ -496,8 +496,9 @@ chains to the hook that would have run without gse:
 
 ```sh
 #!/bin/sh
-if command -v gse >/dev/null 2>&1; then
-  gse hook pre-commit "$@" || exit $?
+g='/Users/alice/.local/bin/gse'; [ -x "$g" ] || g=$(command -v gse) || g=
+if [ -n "$g" ]; then
+  "$g" hook pre-commit "$@" || exit $?
 fi
 hook="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/pre-commit"
 if [ -x "$hook" ]; then exec "$hook" "$@"; fi
@@ -513,7 +514,9 @@ so gse hooks never run there. `gse doctor` detects this and prints the line to
 add to the repository's hooks, or recommends git 2.54.
 
 `gse doctor` also suggests `gse install` after a git upgrade past 2.54, which
-migrates from shims to config hooks. `gse uninstall` restores the previous
+migrates from shims to config hooks; when the recorded binary is gone; and
+when the installed hooks or drivers differ from what the running gse would
+write, as after an upgrade that changes them. `gse uninstall` restores the previous
 configuration.
 
 ## Layering
@@ -570,7 +573,7 @@ in `.gse/config.toml`. CI needs no hooks: these commands read `.gse/` directly.
 | `gse install`, `gse uninstall` | Set up or remove global hooks and drivers |
 | `gse doctor` | Check git version, hooks, ignore rules, identities; run a round-trip self-test |
 | `gse keygen [--handle h] [--github u] [--import f]` | Create or import the personal identity |
-| `gse init` | Create `.gse/`, track gitignored `.env*` files, write `.gse/README.md` and the `AGENTS.md` section; re-run to refresh them and sync |
+| `gse init` | Create `.gse/`, track untracked `.env*` files and gitignore them, write `.gse/README.md` and the `AGENTS.md` section; re-run to refresh them and sync |
 | `gse track <glob> [--scope s]`, `gse untrack <glob>` | Edit tracked patterns |
 | `gse status` | Tracked files, scopes, pending changes, conflicts, recipient drift |
 | `gse sync` | Inbound then outbound sync; stages `.gse/` changes |

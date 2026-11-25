@@ -4,7 +4,9 @@
 #   curl -fsSL https://github.com/danthegoodman1/git-secure-env/releases/latest/download/install.sh | sh
 #
 # GSE_VERSION picks a release tag (default: the latest). GSE_INSTALL_DIR picks
-# the directory (default: ~/.local/bin).
+# the directory (default: ~/.local/bin). When that directory is missing from
+# PATH, the installer adds it in your shell's startup files;
+# GSE_NO_MODIFY_PATH=1 prints the line to add instead.
 set -eu
 
 repo="danthegoodman1/git-secure-env"
@@ -53,8 +55,52 @@ cp "$tmp/$name/gse" "$dir/gse"
 chmod 755 "$dir/gse"
 echo "gse: installed $version to $dir/gse"
 
+# Appends a line to a startup file unless the file already has it.
+add_line() {
+  mkdir -p "$(dirname "$1")"
+  if ! grep -qsF "$2" "$1"; then
+    printf '\n# Added by the gse installer\n%s\n' "$2" >>"$1"
+  fi
+}
+
 case ":$PATH:" in
   *":$dir:"*) ;;
-  *) echo "gse: add $dir to your PATH" ;;
+  *)
+    case "$dir" in
+      "$HOME"/*) shown="\$HOME/${dir#"$HOME"/}" ;;
+      *) shown="$dir" ;;
+    esac
+    line="case \":\$PATH:\" in *\":$shown:\"*) ;; *) export PATH=\"$shown:\$PATH\" ;; esac"
+    shell="$(basename "${SHELL:-sh}")"
+    if [ -n "${GSE_NO_MODIFY_PATH:-}" ]; then
+      echo "gse: $dir is not on PATH; add it in your shell's startup file:"
+      echo "  $line"
+    else
+      case "$shell" in
+        zsh) set -- "${ZDOTDIR:-$HOME}/.zshenv" ;;
+        bash)
+          login="$HOME/.profile"
+          for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+            if [ -f "$f" ]; then
+              login="$f"
+              break
+            fi
+          done
+          set -- "$HOME/.bashrc" "$login"
+          ;;
+        fish) set -- "${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/gse.fish" ;;
+        *) set -- "$HOME/.profile" ;;
+      esac
+      for f in "$@"; do
+        if [ "$shell" = fish ]; then
+          add_line "$f" "fish_add_path -g \"$shown\""
+        else
+          add_line "$f" "$line"
+        fi
+        echo "gse: added $dir to PATH in $f"
+      done
+      echo "gse: open a new terminal, or run: export PATH=\"$dir:\$PATH\""
+    fi
+    ;;
 esac
 echo "gse: next, run \`gse install\` and \`gse keygen\`"

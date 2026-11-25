@@ -4,6 +4,10 @@
 //! alongside each repository's own hooks. Older versions get a global
 //! `core.hooksPath` of shims that run gse and then chain to the hook that
 //! would have run without it.
+//!
+//! Hooks and drivers run the gse binary `gse install` recorded, so they work
+//! in git clients whose PATH lacks gse, such as IDEs. When that binary is
+//! gone, they fall back to the gse on PATH.
 
 use crate::config::{self, RepoConfig};
 use crate::git::{self, Repo};
@@ -70,6 +74,9 @@ pub enum HookMode {
 struct InstallRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
+    /// The gse binary the hooks and drivers run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binary: Option<String>,
     /// The global `core.hooksPath` gse replaced, which the shims chain to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_hooks_path: Option<String>,
@@ -98,19 +105,60 @@ fn slash(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// The command for a config hook. Git appends `"$@"` when the hook has
-/// arguments, which this form allows, and a missing gse lets commits through.
-fn hook_command(event: &str) -> String {
-    format!("command -v gse >/dev/null 2>&1 || exit 0; gse hook {event}")
+/// The gse binary for hooks and drivers to run: the gse on PATH when it is
+/// this binary, because a package manager's link there survives upgrades,
+/// else this binary.
+fn this_binary() -> Result<String> {
+    let exe = std::env::current_exe().context("cannot locate the gse binary")?;
+    let chosen = match find_in_path("gse") {
+        Some(found) if same_file(&found, &exe) => found,
+        _ => exe,
+    };
+    Ok(slash(&chosen))
 }
 
-fn shim_script(name: &str, previous: Option<&str>) -> String {
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn sh_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// Shell that sets `g` to the binary `bin`, or to the gse on PATH when `bin`
+/// is gone, and runs `missing` when neither exists.
+fn locate(bin: &str, missing: &str) -> String {
+    format!(
+        "g={}; [ -x \"$g\" ] || g=$(command -v gse) || {missing}",
+        sh_quote(bin)
+    )
+}
+
+/// The command for a config hook. Git appends `"$@"` when the hook has
+/// arguments, which this form allows, and a missing gse lets commits through.
+fn hook_command(bin: &str, event: &str) -> String {
+    format!("{}; \"$g\" hook {event}", locate(bin, "exit 0"))
+}
+
+fn driver_command(bin: &str) -> String {
+    format!("{}; \"$g\" merge-driver %O %A %B %P", locate(bin, "g=gse"))
+}
+
+fn textconv_command(bin: &str) -> String {
+    format!("{}; \"$g\" textconv", locate(bin, "g=gse"))
+}
+
+fn shim_script(name: &str, previous: Option<&str>, bin: &str) -> String {
     let mut s = String::from(
         "#!/bin/sh\n# Installed by gse (git-secure-env). `gse uninstall` removes it.\n",
     );
     if EVENTS.contains(&name) {
         s.push_str(&format!(
-            "if command -v gse >/dev/null 2>&1; then\n  gse hook {name} \"$@\" || exit $?\nfi\n"
+            "{}\nif [ -n \"$g\" ]; then\n  \"$g\" hook {name} \"$@\" || exit $?\nfi\n",
+            locate(bin, "g=")
         ));
     }
     match previous {
@@ -129,9 +177,12 @@ fn shim_script(name: &str, previous: Option<&str>) -> String {
     s
 }
 
-fn install_config_hooks() -> Result<()> {
+fn install_config_hooks(bin: &str) -> Result<()> {
     for event in EVENTS {
-        git::global_set(&format!("hook.gse-{event}.command"), &hook_command(event))?;
+        git::global_set(
+            &format!("hook.gse-{event}.command"),
+            &hook_command(bin, event),
+        )?;
         git::global_set(&format!("hook.gse-{event}.event"), event)?;
     }
     Ok(())
@@ -145,7 +196,7 @@ fn remove_config_hooks() -> Result<()> {
     Ok(())
 }
 
-fn install_shims(record: &mut InstallRecord) -> Result<()> {
+fn install_shims(record: &mut InstallRecord, bin: &str) -> Result<()> {
     let dir = hooks_dir()?;
     let ours = slash(&dir);
     if let Some(current) = git::global_get("core.hooksPath")?
@@ -159,7 +210,7 @@ fn install_shims(record: &mut InstallRecord) -> Result<()> {
         let path = dir.join(name);
         write_file(
             &path,
-            shim_script(name, record.previous_hooks_path.as_deref()).as_bytes(),
+            shim_script(name, record.previous_hooks_path.as_deref(), bin).as_bytes(),
         )?;
         set_executable(&path);
     }
@@ -181,10 +232,10 @@ fn remove_shims(record: &mut InstallRecord) -> Result<()> {
     Ok(())
 }
 
-fn install_drivers() -> Result<()> {
+fn install_drivers(bin: &str) -> Result<()> {
     git::global_set("merge.gse.name", "gse encrypted env merge")?;
-    git::global_set("merge.gse.driver", "gse merge-driver %O %A %B %P")?;
-    git::global_set("diff.gse.textconv", "gse textconv")
+    git::global_set("merge.gse.driver", &driver_command(bin))?;
+    git::global_set("diff.gse.textconv", &textconv_command(bin))
 }
 
 pub fn install(mode: Option<HookMode>) -> Result<()> {
@@ -204,17 +255,18 @@ pub fn install(mode: Option<HookMode>) -> Result<()> {
         );
     }
     let mut record = load_record()?;
-    install_drivers()?;
+    let bin = this_binary()?;
+    install_drivers(&bin)?;
     match mode {
         HookMode::Config => {
             remove_shims(&mut record)?;
-            install_config_hooks()?;
+            install_config_hooks(&bin)?;
             record.mode = Some("config".into());
             ui::info("installed config-based hooks (hook.gse-*) in your global git config");
         }
         HookMode::Shims => {
             remove_config_hooks()?;
-            install_shims(&mut record)?;
+            install_shims(&mut record, &bin)?;
             record.mode = Some("shims".into());
             ui::info(format!(
                 "installed hook shims in {} and set the global core.hooksPath",
@@ -222,8 +274,10 @@ pub fn install(mode: Option<HookMode>) -> Result<()> {
             ));
         }
     }
+    record.binary = Some(bin.clone());
     save_record(&record)?;
     ui::info("installed the gse merge driver and diff textconv");
+    ui::info(format!("hooks and drivers run {bin}"));
     if crate::identity::load_own()?.is_none() {
         ui::info("next: `gse keygen` creates your identity");
     }
@@ -330,29 +384,70 @@ pub fn doctor(self_test: bool) -> Result<bool> {
         }
     ));
 
-    match find_in_path("gse") {
-        Some(path) => r.pass(format!("gse on PATH at {}", path.display())),
-        None => r.fail("gse is not on PATH, so git hooks cannot run it"),
-    }
-
     let record = load_record()?;
     let mode = record.mode.as_deref();
-    let config_hooks = EVENTS.iter().all(|e| {
-        git::global_get(&format!("hook.gse-{e}.command"))
-            .ok()
-            .flatten()
-            .is_some()
-    });
+    let bin = record.binary.clone().unwrap_or_default();
+    match record.binary.as_deref() {
+        Some(b) if Path::new(b).is_file() => {
+            r.pass(format!("hooks run {b}"));
+            let exe = std::env::current_exe()?;
+            if !same_file(Path::new(b), &exe) {
+                r.warn(format!(
+                    "this gse is {}; `gse install` points the hooks at it",
+                    exe.display()
+                ));
+            }
+        }
+        Some(b) => match find_in_path("gse") {
+            Some(found) => r.warn(format!(
+                "hooks run {b}, which is gone, so they use {} from PATH; run `gse install`",
+                found.display()
+            )),
+            None => r.fail(format!(
+                "hooks run {b}, which is gone, and gse is not on PATH; run `gse install`"
+            )),
+        },
+        None => {}
+    }
+    if find_in_path("gse").is_none() {
+        r.warn("gse is not on your PATH; add its directory to PATH to run it by name");
+    }
+
+    let config_hooks: Vec<Option<String>> = EVENTS
+        .iter()
+        .map(|e| {
+            git::global_get(&format!("hook.gse-{e}.command"))
+                .ok()
+                .flatten()
+        })
+        .collect();
+    let config_current = EVENTS
+        .iter()
+        .zip(&config_hooks)
+        .all(|(e, c)| c.as_deref() == Some(hook_command(&bin, e).as_str()));
     let shims_dir = hooks_dir()?;
     let shims = git::global_get("core.hooksPath")?.as_deref() == Some(slash(&shims_dir).as_str())
         && EVENTS.iter().all(|e| shims_dir.join(e).is_file());
-    match (mode, config_hooks, shims) {
-        (Some("config"), true, _) if modern => r.pass("hooks installed (config-based)"),
+    let shims_current = EVENTS.iter().all(|e| {
+        std::fs::read_to_string(shims_dir.join(e)).ok()
+            == Some(shim_script(e, record.previous_hooks_path.as_deref(), &bin))
+    });
+    let stale = "hooks predate this gse; run `gse install` to update them";
+    match (mode, config_hooks.iter().all(Option::is_some), shims) {
+        (Some("config"), true, _) if modern => {
+            r.pass("hooks installed (config-based)");
+            if !config_current {
+                r.warn(stale);
+            }
+        }
         (Some("config"), true, _) => r.fail(
             "config-based hooks are installed, but this git predates 2.54; run `gse install`",
         ),
         (Some("shims"), _, true) => {
             r.pass("hooks installed (core.hooksPath shims)");
+            if !shims_current {
+                r.warn(stale);
+            }
             if modern {
                 r.warn("git 2.54+ supports config-based hooks; `gse install` migrates to them");
             }
@@ -362,10 +457,14 @@ pub fn doctor(self_test: bool) -> Result<bool> {
 
     let driver = git::global_get("merge.gse.driver")?;
     let textconv = git::global_get("diff.gse.textconv")?;
-    if driver.is_some() && textconv.is_some() {
-        r.pass("merge driver and diff textconv configured");
-    } else {
-        r.fail("merge driver or diff textconv missing; run `gse install`");
+    match (&driver, &textconv) {
+        (Some(d), Some(t)) => {
+            r.pass("merge driver and diff textconv configured");
+            if *d != driver_command(&bin) || *t != textconv_command(&bin) {
+                r.warn("the merge driver and diff textconv predate this gse; run `gse install`");
+            }
+        }
+        _ => r.fail("merge driver or diff textconv missing; run `gse install`"),
     }
 
     let me = crate::sync::load_me()?;
@@ -513,11 +612,29 @@ mod tests {
 
     #[test]
     fn shims_chain_to_the_repository_hook() {
-        let s = shim_script("pre-commit", None);
-        assert!(s.contains("gse hook pre-commit \"$@\" || exit $?"));
+        let s = shim_script("pre-commit", None, "/opt/gse");
+        assert!(s.contains("\"$g\" hook pre-commit \"$@\" || exit $?"));
         assert!(s.contains("--git-common-dir"));
-        let s = shim_script("pre-push", Some("~/hooks"));
-        assert!(!s.contains("gse hook"));
+        let s = shim_script("pre-push", Some("~/hooks"), "/opt/gse");
+        assert!(!s.contains("hook pre-push"));
         assert!(s.contains("hook=\"$HOME/hooks/pre-push\""));
+    }
+
+    fn sh(script: &str) -> String {
+        let out = Command::new("sh").args(["-c", script]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hooks_prefer_the_recorded_binary_and_fall_back_to_path() {
+        let found = sh(&format!("{}; echo \"$g\"", locate("/bin/sh", "exit 0")));
+        assert_eq!(found, "/bin/sh\n");
+        let fallback = sh(&format!(
+            "PATH=/nonexistent; {}; echo \"found $g\"",
+            locate("/nonexistent/gse", "exit 0")
+        ));
+        assert_eq!(fallback, "");
+        assert_eq!(sh_quote("/it's/gse"), r"'/it'\''s/gse'");
     }
 }
